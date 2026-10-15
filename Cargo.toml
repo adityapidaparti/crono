@@ -1,0 +1,24 @@
+[package]
+name = "crono"
+version = "0.1.0"
+edition = "2021"
+description = "Fast local CLI for logging food to Cronometer (no background process)"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls", "cookies"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+chrono-tz = "0.10"
+anyhow = "1"
+thiserror = "2"
+directories = "6"
+rpassword = "7"
+
+[dev-dependencies]
+proptest = "1"
+
+[profile.release]
+lto = true
+strip = true
