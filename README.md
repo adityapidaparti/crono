@@ -1,60 +1,54 @@
 # crono
 
-Fast local CLI for logging food to [Cronometer](https://cronometer.com). No
-background process — it speaks Cronometer's mobile REST API directly and
-authenticates on demand, caching the session token on disk (logins are
-rate-limited server-side, so the token is reused until rejected).
+Log food to your [Cronometer](https://cronometer.com) diary from the terminal.
+
+```console
+$ crono log '#458689' -a "3/4 cup" -m breakfast
+logged: Fage, Total 2% Greek Yogurt, Plain — 0.75 × cup → breakfast on 2026-10-14 ≈ 130 kcal
+```
 
 ## Install
 
-```sh
-cargo install --path .
-```
-
-## Usage
+You need [Rust](https://rustup.rs).
 
 ```sh
-# one-time: authenticate (add --remember to store credentials, 0600, for auto re-auth)
+cargo install --locked --git https://github.com/adityapidaparti/crono
 crono login you@example.com --remember
-
-# find foods
-crono search hummus
-
-# log food (amount: "120g", "5oz", "1.5 cup", "3/4 cup", "1 1/2 cup", "2" = default measure;
-# foods measured only in recipe servings take a serving count, not a weight)
-crono log hummus -a 120g -m dinner
-crono log chicken thigh grilled -a 5oz -m dinner -d yesterday
-crono log "trader joe's brookie" -a 6 -m snacks -d 2026-08-15
-
-# no --meal → picked by time of day (04–09 breakfast, 10–13 lunch, 14–20 dinner, else snacks)
-# --pick 2 → take the 2nd search result; or log by exact id: crono log '#12345' -a 100g
-
-# inspect
-crono day            # today's diary with per-entry kcal + total
-crono day yesterday
-crono food 12345     # measures + macros for a food
-crono export yesterday  # JSON: all diary objects + full food/nutrient metadata
-
-# fix mistakes (ids shown by `crono day`)
-crono rm 987654 -d yesterday
 ```
 
-## Notes
+### With an AI agent
 
-- Protocol reverse-engineered from the Android app (`mobile.cronometer.com`),
-  ported from [rwestergren/cronometer-api-mcp](https://github.com/rwestergren/cronometer-api-mcp).
-- Dates are computed in the *account's* timezone (from the login response),
-  not the host clock.
-- A unit is matched to the food's measures by name: exact, then prefix, then
-  substring. A measure named with a quantity counts as that much of the unit,
-  so with a "1/2 cup" measure, `-a "1 cup"` logs two of it.
-- Session/config live in `~/Library/Application Support/crono/` (macOS).
-- The pure core (parsers, wire formats, measure resolution, export) is covered
-  by [Hegel](https://hegel.dev) property-based tests in `tests/properties.rs`;
-  each test name states the behavior it checks. `cargo test` runs them (the
-  first build compiles Hegel's engine, about a minute);
-  `HEGEL_TEST_CASES=20000 cargo test --test properties` searches harder.
-- `export` uses the current cached session only and validates its account ID
-  and timezone. It never automatically logs in with saved credentials. It
-  preserves recipe quantities and all returned nutrient fields without assuming
-  everything is grams; `missing_food_ids` flags incomplete food metadata.
+Give your agent this repository's link and ask it to install crono. It should:
+
+1. Run `cargo install --locked --git https://github.com/adityapidaparti/crono`.
+2. Run `crono skill install`, which adds the crono skill for Claude Code and
+   Grok. For Codex, run `crono skill install --dir ~/.agents/skills`.
+3. Ask you to run `crono login you@example.com --remember` yourself, since it
+   asks for your password.
+
+## Use
+
+```sh
+crono search hummus                         # find a food and its id
+crono food 455994                           # its measures and macros
+crono log hummus -a 120g -m dinner          # log the top search result
+crono log '#455994' -a "2 tbsp" -d yesterday
+crono day                                   # today's diary, with calories
+crono rm 5300000001                         # remove an entry, by the id `crono day` shows
+crono export yesterday > day.json           # a day's raw diary and nutrient data
+```
+
+An amount can be `120g`, `5oz`, `3/4 cup`, `1 1/2 cup`, or a bare number of the
+food's default measure. Without `-m`, crono picks the meal from the time of
+day. `crono --help` covers the rest.
+
+## Good to know
+
+- Cronometer has no public API. crono uses the one Cronometer's Android app
+  uses, which can change without notice.
+- `--remember` saves your password, unencrypted, in a file only your user can
+  read, so crono can log in again when the session expires.
+
+## Tests
+
+Tested with [Hegel](https://hegel.dev) property-based tests.

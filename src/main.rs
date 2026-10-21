@@ -65,12 +65,32 @@ enum Command {
         #[arg(short, long, default_value = "today", allow_hyphen_values = true)]
         day: DaySpec,
     },
+    /// Print the agent skill for this version, or install it with `skill install`
+    Skill {
+        #[command(subcommand)]
+        action: Option<SkillCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillCmd {
+    /// Write the skill to DIR/NAME/SKILL.md [default DIR: ~/.claude/skills, read by Claude Code and Grok CLI]
+    Install {
+        /// Skills directory of another agent
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // The skill needs no session, so it runs before one is loaded.
+    let command = match cli.command {
+        Command::Skill { action } => return skill_cmd(action),
+        command => command,
+    };
     let mut client = Client::new()?;
-    match cli.command {
+    match command {
         Command::Login { email, remember } => cmd_login(&mut client, &email, remember),
         Command::Search { query, limit } => cmd_search(&mut client, &query.join(" "), limit),
         Command::Food { food_id } => cmd_food(&mut client, food_id),
@@ -84,6 +104,7 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
             Ok(())
         },
+        Command::Skill { .. } => unreachable!("handled before the session loads"),
         Command::Rm { entry_id, day } => cmd_rm(&mut client, entry_id, day),
     }
 }
@@ -251,5 +272,20 @@ fn cmd_rm(client: &mut Client, entry_id: i64, day: DaySpec) -> Result<()> {
     }
     client.delete_entries(&target)?;
     println!("removed entry {entry_id} from {date}");
+    Ok(())
+}
+
+fn skill_cmd(action: Option<SkillCmd>) -> Result<()> {
+    use crono::skill;
+    match action {
+        None => print!("{}", skill::SKILL),
+        Some(SkillCmd::Install { dir }) => {
+            let dir = match dir {
+                Some(d) => d,
+                None => skill::default_dir()?,
+            };
+            println!("{}", skill::install(&dir, skill::NAME, skill::SKILL)?);
+        }
+    }
     Ok(())
 }
