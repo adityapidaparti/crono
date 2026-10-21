@@ -1,0 +1,8 @@
+# Hegel settings for `cargo test` (see https://docs.rs/hegeltest, "Settings profiles").
+# Override for one run with HEGEL_TEST_CASES=20000.
+
+[profiles.development]
+test_cases = 5000
+
+[profiles.ci]
+test_cases = 5000

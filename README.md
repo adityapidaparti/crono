@@ -20,7 +20,8 @@ crono login you@example.com --remember
 # find foods
 crono search hummus
 
-# log food (amount: "120g", "5oz", "1.5 cup", "2" = default measure)
+# log food (amount: "120g", "5oz", "1.5 cup", "3/4 cup", "1 1/2 cup", "2" = default measure;
+# foods measured only in recipe servings take a serving count, not a weight)
 crono log hummus -a 120g -m dinner
 crono log chicken thigh grilled -a 5oz -m dinner -d yesterday
 crono log "trader joe's brookie" -a 6 -m snacks -d 2026-08-15
@@ -45,8 +46,11 @@ crono rm 987654 -d yesterday
 - Dates are computed in the *account's* timezone (from the login response),
   not the host clock.
 - Session/config live in `~/Library/Application Support/crono/` (macOS).
-- The pure core (parsers, wire formats, measure resolution) is covered by
-  property-based tests: `cargo test`.
+- The pure core (parsers, wire formats, measure resolution, export) is covered
+  by [Hegel](https://hegel.dev) property-based tests in `tests/properties.rs`;
+  each test name states the behavior it checks. `cargo test` runs them (the
+  first build compiles Hegel's engine, about a minute);
+  `HEGEL_TEST_CASES=20000 cargo test --test properties` searches harder.
 - `export` uses the current cached session only and validates its account ID
   and timezone. It never automatically logs in with saved credentials. It
   preserves recipe quantities and all returned nutrient fields without assuming

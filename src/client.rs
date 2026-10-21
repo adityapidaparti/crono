@@ -472,42 +472,58 @@ pub fn resolve_amount(food: &Food, amount: &Amount) -> Result<ResolvedAmount> {
         }
     };
 
-    let Some(unit) = &amount.unit else {
-        return Ok(build(default, amount.value));
-    };
-
-    // Literal weights bypass measure math: `grams` is grams.
-    if matches!(unit.as_str(), "g" | "gram" | "grams") {
-        let measure = find_measure(food, "g").unwrap_or(default);
-        return Ok(ResolvedAmount {
-            measure_id: measure.id,
+    let resolved = match amount.unit.as_deref() {
+        None => build(default, amount.value),
+        // Literal weights bypass measure math: `grams` is grams.
+        Some("g" | "gram" | "grams") => ResolvedAmount {
+            measure_id: weight_measure(food, "g", default)?.id,
             grams: amount.value,
             display: format!("{} g", amount.value),
             is_recipe: false,
-        });
-    }
-    if matches!(unit.as_str(), "oz" | "ounce" | "ounces") {
-        let measure = find_measure(food, "oz").unwrap_or(default);
-        return Ok(ResolvedAmount {
-            measure_id: measure.id,
+        },
+        Some("oz" | "ounce" | "ounces") => ResolvedAmount {
+            measure_id: weight_measure(food, "oz", default)?.id,
             grams: amount.value * GRAMS_PER_OZ,
             display: format!("{} oz", amount.value),
             is_recipe: false,
-        });
+        },
+        Some(unit) => {
+            let m = find_measure(food, unit).ok_or_else(|| {
+                anyhow!(
+                    "no measure matching '{unit}' for '{}'; available: {}",
+                    food.name,
+                    food.measures
+                        .iter()
+                        .map(|m| m.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            build(m, amount.value)
+        }
+    };
+    // JSON has no infinity: serde_json would send `"grams": null`.
+    if !resolved.grams.is_finite() {
+        bail!("{} of '{}' is too large to log", resolved.display, food.name);
     }
+    Ok(resolved)
+}
 
-    let m = find_measure(food, unit).ok_or_else(|| {
-        anyhow!(
-            "no measure matching '{unit}' for '{}'; available: {}",
-            food.name,
-            food.measures
-                .iter()
-                .map(|m| m.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })?;
-    Ok(build(m, amount.value))
+/// The measure a literal weight is logged against: the food's own `unit`
+/// measure, else its default, else any other — never a Recipe measure, whose
+/// `grams` Cronometer reads as a serving count.
+fn weight_measure<'a>(food: &'a Food, unit: &str, default: &'a Measure) -> Result<&'a Measure> {
+    let by_weight = |m: &&Measure| m.kind != "Recipe";
+    find_measure(food, unit)
+        .filter(by_weight)
+        .or(Some(default).filter(by_weight))
+        .or_else(|| food.measures.iter().find(by_weight))
+        .ok_or_else(|| {
+            anyhow!(
+                "'{}' is measured in recipe servings only; log a serving count (e.g. -a 1) instead of a weight",
+                food.name
+            )
+        })
 }
 
 /// Case-insensitive measure lookup: exact name, then prefix, then substring.

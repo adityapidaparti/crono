@@ -134,28 +134,66 @@ impl fmt::Display for Amount {
 impl FromStr for Amount {
     type Err = String;
 
-    /// Accepts `"120g"`, `"1.5 cup"`, `"5 oz"`, `"2"`, `"0.5 sandwich"`.
+    /// Accepts `"120g"`, `"1.5 cup"`, `"5 oz"`, `"2"`, `"0.5 sandwich"`, and
+    /// fractions: `"3/4 cup"`, `"1 1/2 cup"`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
         if s.is_empty() {
             return Err("empty amount".into());
         }
-        let num_end = s
-            .char_indices()
-            .take_while(|(_, c)| c.is_ascii_digit() || *c == '.')
-            .map(|(i, c)| i + c.len_utf8())
-            .last()
-            .ok_or_else(|| format!("amount '{s}' must start with a number"))?;
-        let (num, rest) = s.split_at(num_end);
-        let value: f64 = num
-            .parse()
-            .map_err(|_| format!("bad number '{num}' in amount '{s}'"))?;
+        let (num, rest) = split_number(s);
+        if num.is_empty() {
+            return Err(format!("amount '{s}' must start with a number"));
+        }
+        let number = |n: &str| {
+            n.parse::<f64>()
+                .map_err(|_| format!("bad number '{n}' in amount '{s}'"))
+        };
+        let whole = |n: &str| match n.contains('.') {
+            true => Err(format!("fractions take whole numbers, got '{n}' in amount '{s}'")),
+            false => number(n),
+        };
+        let (value, rest) = if let Some(after) = rest.strip_prefix('/') {
+            let (den, rest) = split_number(after);
+            (whole(num)? / whole(den)?, rest)
+        } else if let Some((top, den, rest)) = leading_fraction(rest) {
+            (whole(num)? + whole(top)? / whole(den)?, rest)
+        } else {
+            (number(num)?, rest)
+        };
         if !value.is_finite() || value <= 0.0 {
-            return Err(format!("amount must be a positive finite number, got '{num}'"));
+            return Err(format!("amount must be a positive finite number, got '{s}'"));
         }
         let unit = rest.trim();
+        // A unit that starts like a number ("1,5 cup", "2 .5 cup") would
+        // otherwise be matched as a measure name and log the wrong quantity.
+        if let Some(c) = unit.chars().next().filter(|c| c.is_ascii_digit() || ".,/".contains(*c)) {
+            return Err(format!(
+                "unexpected '{c}' in amount '{s}' (write decimals like 1.5 and fractions like 3/4 or 1 1/2)"
+            ));
+        }
         Ok(Amount::new(value, (!unit.is_empty()).then_some(unit)))
     }
+}
+
+/// Split the leading run of ASCII digits and '.' off `s`.
+fn split_number(s: &str) -> (&str, &str) {
+    s.split_at(s.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(s.len()))
+}
+
+/// The fraction of a mixed number: `" 1/2 cup"` → `("1", "2", " cup")`.
+fn leading_fraction(s: &str) -> Option<(&str, &str, &str)> {
+    let unspaced = s.trim_start();
+    if unspaced.len() == s.len() {
+        return None;
+    }
+    let (top, rest) = split_number(unspaced);
+    let rest = rest.strip_prefix('/')?;
+    if top.is_empty() {
+        return None;
+    }
+    let (den, rest) = split_number(rest);
+    Some((top, den, rest))
 }
 
 /// A day specifier: `today`, `yesterday`, `tomorrow`, `-N` (N days ago),
@@ -168,12 +206,15 @@ pub enum DaySpec {
 }
 
 impl DaySpec {
-    /// Resolve against a reference "today" (injected for testability).
-    pub fn resolve(&self, today: NaiveDate) -> NaiveDate {
+    /// Resolve against a reference "today" (injected for testability). Errors
+    /// when an offset lands outside the dates chrono can represent.
+    pub fn resolve(&self, today: NaiveDate) -> Result<NaiveDate, String> {
         match self {
-            DaySpec::Today => today,
-            DaySpec::Offset(n) => today + Duration::days(*n),
-            DaySpec::Date(d) => *d,
+            DaySpec::Today => Ok(today),
+            DaySpec::Offset(n) => Duration::try_days(*n)
+                .and_then(|d| today.checked_add_signed(d))
+                .ok_or_else(|| format!("{n} days from {today} is out of range")),
+            DaySpec::Date(d) => Ok(*d),
         }
     }
 }
@@ -189,8 +230,13 @@ impl FromStr for DaySpec {
             "tomorrow" => return Ok(DaySpec::Offset(1)),
             _ => {}
         }
+        // "-N" takes plain digits only: "--5" or "-+5" must not mean a future
+        // day (or overflow on negation).
         if let Some(rest) = s.strip_prefix('-') {
-            if let Ok(n) = rest.parse::<i64>() {
+            if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+                let n: i64 = rest
+                    .parse()
+                    .map_err(|_| format!("day offset '{s}' is too large"))?;
                 return Ok(DaySpec::Offset(-n));
             }
         }

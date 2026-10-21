@@ -36,7 +36,7 @@ enum Command {
     Log {
         /// Food search query (or #<id> for an exact food id)
         query: Vec<String>,
-        /// Amount, e.g. "120g", "5oz", "1.5 cup", "2" (default measure)
+        /// Amount, e.g. "120g", "5oz", "1.5 cup", "3/4 cup", "2" (default measure)
         #[arg(short, long, default_value = "1")]
         amount: Amount,
         /// breakfast|lunch|dinner|snacks|uncategorized (b|l|d|s|u); default: by time of day
@@ -80,7 +80,7 @@ fn main() -> Result<()> {
         Command::Day { day } => cmd_day(&mut client, day),
         Command::Export { day } => {
             let (today, _) = client.account_now();
-            let snapshot = client.export_day(day.resolve(today))?;
+            let snapshot = client.export_day(day.resolve(today).map_err(anyhow::Error::msg)?)?;
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
             Ok(())
         },
@@ -163,7 +163,7 @@ fn cmd_log(
 
     let resolved = resolve_amount(&food, amount)?;
     let (today, now) = client.account_now();
-    let date = day.resolve(today);
+    let date = day.resolve(today).map_err(anyhow::Error::msg)?;
     let meal = meal.unwrap_or_else(|| Meal::from_hour(chrono::Timelike::hour(&now)));
 
     client.add_serving(food.id, &resolved, meal, date, now)?;
@@ -176,7 +176,7 @@ fn cmd_log(
 
 fn cmd_day(client: &mut Client, day: DaySpec) -> Result<()> {
     let (today, _) = client.account_now();
-    let date = day.resolve(today);
+    let date = day.resolve(today).map_err(anyhow::Error::msg)?;
     let entries = client.get_diary(date)?;
     let servings: Vec<&Value> = entries
         .iter()
@@ -237,7 +237,7 @@ fn cmd_day(client: &mut Client, day: DaySpec) -> Result<()> {
 
 fn cmd_rm(client: &mut Client, entry_id: i64, day: DaySpec) -> Result<()> {
     let (today, _) = client.account_now();
-    let date = day.resolve(today);
+    let date = day.resolve(today).map_err(anyhow::Error::msg)?;
     let entries = client.get_diary(date)?;
     let target: Vec<Value> = entries
         .into_iter()
