@@ -180,6 +180,23 @@ fn measure(id: i64, name: &str) -> Measure {
     Measure { id, name: name.to_string(), value: 100.0, amount: 1.0, kind: "Weight".into() }
 }
 
+const WEIGHT_WORDS: &[&str] = &["g", "gram", "grams", "oz", "ounce", "ounces"];
+
+/// Units crono reads as a literal weight rather than a measure name.
+fn is_weight_word(unit: &str) -> bool {
+    WEIGHT_WORDS.contains(&unit)
+}
+
+/// How many `unit`s a measure's name says it holds ("1/2 cup" holds half a
+/// cup); 1 when the name doesn't start with a quantity of that unit. Pinned
+/// on its own by the "named with a quantity" properties.
+fn units_in_name(m: &Measure, unit: &str) -> f64 {
+    match m.name.parse::<Amount>() {
+        Ok(named) if named.unit.as_deref().is_some_and(|u| u.starts_with(unit)) => named.value,
+        _ => 1.0,
+    }
+}
+
 /// Whether a weight can be logged against one of the food's measures (any
 /// measure but a Recipe serving).
 fn can_be_weighed(food: &Food) -> bool {
@@ -301,11 +318,13 @@ fn the_number_typed_is_the_quantity_used(tc: TestCase) {
     assert_eq!(amount.value, quantity);
 }
 
-/// Everything after the number is the unit, trimmed and lowercased; with
-/// nothing after it, there is no unit (the food's default measure).
+/// Everything after a decimal number is the unit, trimmed and lowercased;
+/// with nothing after it, there is no unit (the food's default measure).
 #[hegel::test]
 fn the_rest_of_an_amount_is_its_unit(tc: TestCase) {
     let number = tc.draw(gs::from_regex(r"[1-9][0-9]*(\.[0-9]*)?"));
+    // 310+ digit numbers overflow a float and are rejected (checked above).
+    tc.assume(number.parse::<f64>().unwrap().is_finite());
     let spacing = tc.draw(whitespace());
     let unit = tc.draw(hegel::one_of!(gs::just(String::new()), typed_units()));
     let amount: Amount = format!("{number}{spacing}{unit}").parse().unwrap();
@@ -314,25 +333,39 @@ fn the_rest_of_an_amount_is_its_unit(tc: TestCase) {
 }
 
 /// "120g", "120 g" and "  120   g  " are the same amount: spacing never
-/// changes what gets logged.
+/// changes what gets logged (or whether it's accepted).
+/// The explicit case is a number too big for a float: both forms must be
+/// rejected, even though their error messages quote different text.
 #[hegel::test]
+#[hegel::explicit_test_case(
+    number = format!("1{}", "0".repeat(309)),
+    unit = "g".to_string(),
+    before = String::new(),
+    gap = " ".to_string(),
+    after = String::new()
+)]
 fn spacing_does_not_change_an_amount(tc: TestCase) {
     let number = tc.draw(gs::from_regex(r"[1-9][0-9]*(\.[0-9]+)?"));
     let unit = tc.draw(typed_units());
-    let (before, gap, after) = (tc.draw(whitespace()), tc.draw(whitespace()), tc.draw(whitespace()));
-    let tidy = format!("{number}{unit}").parse::<Amount>();
-    let spaced = format!("{before}{number}{gap}{unit}{after}").parse::<Amount>();
+    let before = tc.draw(whitespace());
+    let gap = tc.draw(whitespace());
+    let after = tc.draw(whitespace());
+    let tidy = format!("{number}{unit}").parse::<Amount>().ok();
+    let spaced = format!("{before}{number}{gap}{unit}{after}").parse::<Amount>().ok();
     assert_eq!(tidy, spaced);
 }
 
-/// "120g" and "120G" are the same amount: capitalization of the unit's
-/// letters never changes what gets logged.
+/// "120g" and "120G" are the same amount: capitalization of the unit's ASCII
+/// letters never changes what gets logged (or whether it's accepted).
 #[hegel::test]
 fn capitalization_does_not_change_an_amount(tc: TestCase) {
     let number = tc.draw(gs::from_regex(r"[1-9][0-9]*(\.[0-9]+)?"));
     let unit = tc.draw(typed_units());
     let recased = draw_capitalization(&tc, &unit);
-    assert_eq!(format!("{number}{unit}").parse::<Amount>(), format!("{number}{recased}").parse::<Amount>());
+    assert_eq!(
+        format!("{number}{unit}").parse::<Amount>().ok(),
+        format!("{number}{recased}").parse::<Amount>().ok()
+    );
 }
 
 /// An accepted amount, written out, reads back as the same amount, for any
@@ -345,35 +378,97 @@ fn an_amount_written_out_reads_back_the_same(tc: TestCase) {
     assert_eq!(amount.to_string().parse::<Amount>(), Ok(amount));
 }
 
-/// Typing a fraction ("3/4 cup", "1 1/2 cup") either fails with an error or
-/// logs that many cups, never a different amount, even when the food has a
-/// measure named after the fraction (like "1/2 cup").
+/// "3/4" means three quarters and "1 1/2" one and a half, with or without a
+/// unit after them.
 #[hegel::test]
-fn fractions_are_never_misread(tc: TestCase) {
+fn fractions_mean_their_value(tc: TestCase) {
+    let whole = tc.draw(gs::integers::<u32>());
+    let top = tc.draw(gs::integers::<u32>().min_value(1));
+    let bottom = tc.draw(gs::integers::<u32>().min_value(1));
+    let spacing = tc.draw(whitespace());
+    let unit = tc.draw(hegel::one_of!(gs::just(String::new()), typed_units()));
+    let (number, expected) = if tc.draw(gs::booleans()) {
+        (format!("{whole} {top}/{bottom}"), whole as f64 + top as f64 / bottom as f64)
+    } else {
+        (format!("{top}/{bottom}"), top as f64 / bottom as f64)
+    };
+    let typed = format!("{number}{spacing}{unit}");
+    assert_eq!(typed.parse::<Amount>().map(|a| a.value), Ok(expected), "{typed:?}");
+}
+
+/// A fraction with a zero denominator ("1/0 cup") is rejected.
+#[hegel::test]
+fn a_zero_denominator_is_rejected(tc: TestCase) {
+    let top = tc.draw(gs::from_regex(r"[0-9]+"));
+    let unit = tc.draw(hegel::one_of!(gs::just(String::new()), typed_units()));
+    let typed = format!("{top}/0{unit}");
+    assert!(typed.parse::<Amount>().is_err(), "{typed:?} was accepted");
+}
+
+/// Typing a fraction ("3/4 cup", "1 1/2 cup") logs exactly that many cups,
+/// whichever cup measure the food has: "cup", "1 cup", or only one named
+/// after some fraction ("1/2 cup"). Each of the nine float steps on the way
+/// can be off by half an ulp, hence the 8-epsilon tolerance.
+#[hegel::test]
+fn fractions_log_exactly_that_many_cups(tc: TestCase) {
     let whole = tc.draw(gs::integers::<u32>().min_value(1));
     let top = tc.draw(gs::integers::<u32>().min_value(1));
     let bottom = tc.draw(gs::integers::<u32>().min_value(1));
-    let fraction = top as f64 / bottom as f64;
-    let food = food_with(vec![
-        Measure { value: 240.0, ..measure(1, "cup") },
-        Measure { value: 240.0 * fraction, ..measure(2, &format!("{top}/{bottom} cup")) },
-    ]);
-    let (typed, intended_cups) = if tc.draw(gs::booleans()) {
-        (format!("{whole} {top}/{bottom} cup"), whole as f64 + fraction)
-    } else {
-        (format!("{top}/{bottom} cup"), fraction)
+    let (named_top, named_bottom) =
+        (tc.draw(gs::integers::<u32>().min_value(1)), tc.draw(gs::integers::<u32>().min_value(1)));
+    let named_cups = named_top as f64 / named_bottom as f64;
+    let fraction_cup = Measure { value: 240.0 * named_cups, ..measure(2, &format!("{named_top}/{named_bottom} cup")) };
+    let measures = match tc.draw(gs::integers::<u8>().max_value(3)) {
+        0 => vec![Measure { value: 240.0, ..measure(1, "cup") }],
+        1 => vec![Measure { value: 240.0, ..measure(1, "1 cup") }],
+        2 => vec![fraction_cup],
+        _ => vec![fraction_cup, Measure { value: 240.0, ..measure(1, "cup") }],
     };
-    let logged = typed.parse::<Amount>().ok().and_then(|a| resolve_amount(&food, &a).ok());
-    if let Some(resolved) = logged {
-        let logged_cups = resolved.grams / 240.0;
-        // The same fraction computed two ways differs by a few ulps at most;
-        // a misread is off by a whole factor.
-        assert!(
-            (logged_cups - intended_cups).abs() <= 1e-12 * intended_cups,
-            "{typed:?} logged {logged_cups} cups ({})",
-            resolved.display
-        );
-    }
+    let (typed, intended_cups) = if tc.draw(gs::booleans()) {
+        (format!("{whole} {top}/{bottom} cup"), whole as f64 + top as f64 / bottom as f64)
+    } else {
+        (format!("{top}/{bottom} cup"), top as f64 / bottom as f64)
+    };
+    let amount: Amount = typed.parse().unwrap();
+    let resolved = resolve_amount(&food_with(measures), &amount).unwrap();
+    let logged_cups = resolved.grams / 240.0;
+    assert!(
+        (logged_cups - intended_cups).abs() <= 8.0 * f64::EPSILON * intended_cups,
+        "{typed:?} logged {logged_cups} cups ({})",
+        resolved.display
+    );
+}
+
+/// A measure named with a quantity holds that many units: if a food's only
+/// measure is "2 slices" (90 g), "3 slices" logs 135 g.
+#[hegel::test]
+fn a_measure_named_with_a_quantity_holds_that_many_units(tc: TestCase) {
+    let word = tc.draw(gs::from_regex(r"[a-z]+"));
+    tc.assume(!is_weight_word(&word));
+    let held = tc.draw(gs::from_regex(r"[1-9][0-9]*(\.[0-9]+)?"));
+    let typed = tc.draw(gs::from_regex(r"[1-9][0-9]*(\.[0-9]+)?"));
+    let grams = tc.draw(gs::floats::<f64>().min_value(1.0).max_value(10_000.0));
+    let (held_n, typed_n): (f64, f64) = (held.parse().unwrap(), typed.parse().unwrap());
+    let expected = typed_n / held_n * grams;
+    tc.assume(expected.is_finite());
+    let food = food_with(vec![Measure { value: grams, ..measure(1, &format!("{held} {word}")) }]);
+    let resolved = resolve_amount(&food, &format!("{typed} {word}").parse().unwrap()).unwrap();
+    assert_eq!(resolved.grams, expected, "\"{typed} {word}\" against \"{held} {word}\" ({grams} g)");
+}
+
+/// A quantity that belongs to another word doesn't scale the measure: with
+/// only "12 fl oz can", "-a 2 can" is two cans.
+#[hegel::test]
+fn a_quantity_for_another_word_does_not_scale_the_measure(tc: TestCase) {
+    let word = tc.draw(gs::from_regex(r"[a-z]+"));
+    tc.assume(!is_weight_word(&word));
+    let other = tc.draw(gs::from_regex(r"[a-z]+( [a-z]+)*"));
+    tc.assume(!other.starts_with(&word));
+    let held = tc.draw(gs::from_regex(r"[1-9][0-9]*"));
+    let count = tc.draw(gs::floats::<f64>().min_value(0.01).max_value(1_000.0));
+    let food = food_with(vec![Measure { value: 355.0, ..measure(1, &format!("{held} {other} {word}")) }]);
+    let resolved = resolve_amount(&food, &Amount::new(count, Some(&word))).unwrap();
+    assert_eq!(resolved.grams, count * 355.0, "{count} {word} against \"{held} {other} {word}\"");
 }
 
 // ---------------------------------------------------------------------------
@@ -387,16 +482,32 @@ fn any_typed_day_is_accepted_or_rejected_without_crashing(tc: TestCase) {
     let _ = typed.parse::<DaySpec>();
 }
 
-/// Any "-N" crono accepts turns into a calendar date or an out-of-range
-/// error, never a crash, whatever today is.
+/// "-N" resolves to exactly N days before today, or, when that is before
+/// the earliest date chrono can represent, to an out-of-range error. It never
+/// crashes or quietly lands on some other day.
 #[hegel::test]
-fn every_accepted_day_offset_resolves_without_crashing(tc: TestCase) {
-    let n = tc.draw(gs::integers::<i64>());
-    let typed = format!("-{n}");
+fn minus_n_resolves_exactly_or_reports_out_of_range(tc: TestCase) {
+    let n = tc.draw(gs::integers::<i64>().min_value(0));
     let today = tc.draw(any_date());
-    if let Ok(day) = typed.parse::<DaySpec>() {
-        let _ = day.resolve(today);
+    let day: DaySpec = format!("-{n}").parse().unwrap();
+    let target = today.num_days_from_ce() as i128 - n as i128;
+    let earliest = NaiveDate::MIN.num_days_from_ce() as i128;
+    match day.resolve(today) {
+        Ok(date) => assert_eq!(date.num_days_from_ce() as i128, target, "-{n} on {today} gave {date}"),
+        Err(error) => assert!(target < earliest, "-{n} on {today} refused: {error}"),
     }
+}
+
+/// After the minus, a day offset is digits only: "-+1", "--1", "- 1" and
+/// "-1x" are rejected rather than read as some other day.
+#[hegel::test]
+fn a_day_offset_is_a_minus_and_digits_only(tc: TestCase) {
+    let before = tc.draw(gs::from_regex(r"[+\- a-z]*"));
+    let digits = tc.draw(gs::from_regex(r"[0-9]+"));
+    let after = tc.draw(gs::from_regex(r"[+a-z]*"));
+    tc.assume(!(before.is_empty() && after.is_empty()));
+    let typed = format!("-{before}{digits}{after}");
+    assert!(typed.parse::<DaySpec>().is_err(), "{typed:?} was accepted");
 }
 
 /// "-N" means exactly N days before today.
@@ -702,27 +813,35 @@ fn weighing_food_never_points_at_a_recipe_serving(tc: TestCase) {
 
 /// A bare number ("-a 2") logs that many of the food's declared default
 /// measure (or its first measure when the declared one is missing): for a
-/// non-recipe measure, 2 × the measure's grams. The only refusal allowed is
-/// a total too large to send.
+/// non-recipe measure, 2 × the measure's grams. It's refused only when that
+/// total is too large to send. (Recipe serving math isn't pinned down: it
+/// depends on how Cronometer reads recipe measures.)
 #[hegel::test]
 fn a_bare_number_logs_that_many_of_the_default_measure(tc: TestCase) {
     let food = tc.draw(foods(1));
     let count = tc.draw(positive_amounts());
     let default = food.measure(food.default_measure_id).unwrap_or(&food.measures[0]);
-    match resolve_amount(&food, &Amount::new(count, None)) {
-        Ok(resolved) => {
+    let result = resolve_amount(&food, &Amount::new(count, None));
+    if default.kind == "Recipe" {
+        if let Ok(resolved) = result {
             assert_eq!(resolved.measure_id, default.id);
-            if default.kind != "Recipe" {
-                assert_eq!(resolved.grams, count * default.value);
-            }
         }
-        Err(error) => assert!(error.to_string().contains("too large"), "{error}"),
+        return;
+    }
+    let expected = count * default.value;
+    if expected.is_finite() {
+        let resolved = result.unwrap();
+        assert_eq!(resolved.measure_id, default.id);
+        assert_eq!(resolved.grams, expected);
+    } else {
+        assert!(result.is_err(), "{count} × {} g gave {result:?}", default.value);
     }
 }
 
-/// "N cup" logs a measure whose name contains "cup", and sends N × that
-/// measure's grams (for non-recipe measures). The only refusal allowed is a
-/// total too large to send.
+/// "N cup" logs the measure crono's lookup picks for "cup" (exact name, then
+/// prefix, then substring) and sends N cups of it: N × its grams, or N × 2
+/// for a measure named "1/2 cup". It's refused only when that total is too
+/// large to send. (Recipe serving math isn't pinned down.)
 #[hegel::test]
 fn n_of_a_measure_sends_n_times_its_grams(tc: TestCase) {
     let food = tc.draw(foods(1));
@@ -731,17 +850,45 @@ fn n_of_a_measure_sends_n_times_its_grams(tc: TestCase) {
     let count = tc.draw(positive_amounts());
     let amount = Amount::new(count, Some(&name));
     let unit = amount.unit.clone().unwrap();
-    tc.assume(!matches!(unit.as_str(), "g" | "gram" | "grams" | "oz" | "ounce" | "ounces"));
-    match resolve_amount(&food, &amount) {
-        Ok(resolved) => {
-            let chosen = food.measure(resolved.measure_id).unwrap();
-            assert!(chosen.name.to_ascii_lowercase().contains(&unit), "{unit:?} chose {chosen:?}");
-            if chosen.kind != "Recipe" {
-                assert_eq!(resolved.grams, count * chosen.value);
-            }
+    tc.assume(!is_weight_word(&unit));
+    let chosen = find_measure(&food, &unit).expect("a measure's own name matches it");
+    let result = resolve_amount(&food, &amount);
+    if chosen.kind == "Recipe" {
+        if let Ok(resolved) = result {
+            assert_eq!(resolved.measure_id, chosen.id);
         }
-        Err(error) => assert!(error.to_string().contains("too large"), "{error}"),
+        return;
     }
+    let expected = count / units_in_name(chosen, &unit) * chosen.value;
+    if expected.is_finite() {
+        let resolved = result.unwrap();
+        assert_eq!(resolved.measure_id, chosen.id, "{unit:?}");
+        assert_eq!(resolved.grams, expected, "{count} {unit:?} of {chosen:?}");
+    } else {
+        assert!(result.is_err(), "{count} {unit:?} of {chosen:?} gave {result:?}");
+    }
+}
+
+/// "-a 2 cup" logs the measure named exactly "cup", even when measures that
+/// start with or contain "cup" are listed before it.
+#[hegel::test]
+fn a_typed_unit_logs_the_exactly_named_measure(tc: TestCase) {
+    let unit = tc.draw(lowercase_units());
+    tc.assume(!is_weight_word(&unit));
+    let suffixes = tc.draw(gs::vecs(gs::from_regex(r"[a-z ,]+")).min_size(1));
+    let prefixes = tc.draw(gs::vecs(gs::from_regex(r"[a-z ,]+")));
+    let mut measures: Vec<Measure> = suffixes
+        .iter()
+        .map(|s| format!("{unit}{s}"))
+        .chain(prefixes.iter().map(|p| format!("{p}{unit}")))
+        .enumerate()
+        .map(|(i, name)| measure(i as i64 + 1, &name))
+        .collect();
+    let at = tc.draw(gs::integers::<usize>().max_value(measures.len()));
+    measures.insert(at, measure(0, &unit));
+    let count = tc.draw(positive_amounts().max_value(1e300));
+    let resolved = resolve_amount(&food_with(measures), &Amount::new(count, Some(&unit))).unwrap();
+    assert_eq!(resolved.measure_id, 0, "{resolved:?}");
 }
 
 /// A unit that names a measure exactly gets that measure, even when other
@@ -862,28 +1009,24 @@ fn entries_count_servings_exactly_when_they_point_at_a_recipe_measure(tc: TestCa
     }
 }
 
-/// Logging 100 g of a food that has no Recipe measures (so its calories are
-/// per 100 g) estimates exactly its per-100 g calories, up to the two float
-/// roundings in ×100 then ÷100.
+/// For a food without Recipe measures (so its calorie label is per 100 g),
+/// the calories crono estimates for N g are the label × N ÷ 100. The label
+/// is planted among the food's other nutrients so the test knows its value.
 #[hegel::test]
-fn logging_100g_estimates_the_per_100g_calories(tc: TestCase) {
+fn estimated_calories_are_the_per_100g_label_scaled_by_weight(tc: TestCase) {
     let mut food = tc.draw(foods(1));
     for m in &mut food.measures {
         if m.kind == "Recipe" {
             m.kind = "Weight".into();
         }
     }
-    if food.nutrient(NUTRIENT_ENERGY_KCAL).is_none() {
-        let kcal = tc.draw(gs::floats::<f64>().min_value(0.0).max_value(1_000_000.0));
-        food.nutrients.push(NutrientAmount { id: NUTRIENT_ENERGY_KCAL, amount: kcal });
-    }
-    let label = food.nutrient(NUTRIENT_ENERGY_KCAL).unwrap();
-    let resolved = resolve_amount(&food, &Amount::new(100.0, Some("g"))).unwrap();
-    let estimate = estimate_kcal(&food, &resolved).unwrap();
-    assert!(
-        (estimate - label).abs() <= 2.0 * f64::EPSILON * label,
-        "estimates {estimate} for a {label} kcal/100 g label"
-    );
+    let label = tc.draw(gs::floats::<f64>().min_value(0.0).max_value(1_000_000.0));
+    food.nutrients.retain(|n| n.id != NUTRIENT_ENERGY_KCAL);
+    let at = tc.draw(gs::integers::<usize>().max_value(food.nutrients.len()));
+    food.nutrients.insert(at, NutrientAmount { id: NUTRIENT_ENERGY_KCAL, amount: label });
+    let grams = tc.draw(positive_amounts());
+    let resolved = resolve_amount(&food, &Amount::new(grams, Some("g"))).unwrap();
+    assert_eq!(estimate_kcal(&food, &resolved), Some(label * grams / 100.0), "{grams} g at {label} kcal/100 g");
 }
 
 /// When Cronometer has no calorie figure for a food, crono's estimate is

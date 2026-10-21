@@ -45,6 +45,9 @@ crono rm 987654 -d yesterday
   ported from [rwestergren/cronometer-api-mcp](https://github.com/rwestergren/cronometer-api-mcp).
 - Dates are computed in the *account's* timezone (from the login response),
   not the host clock.
+- A unit is matched to the food's measures by name: exact, then prefix, then
+  substring. A measure named with a quantity counts as that much of the unit,
+  so with a "1/2 cup" measure, `-a "1 cup"` logs two of it.
 - Session/config live in `~/Library/Application Support/crono/` (macOS).
 - The pure core (parsers, wire formats, measure resolution, export) is covered
   by [Hegel](https://hegel.dev) property-based tests in `tests/properties.rs`;

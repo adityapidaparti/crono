@@ -499,7 +499,7 @@ pub fn resolve_amount(food: &Food, amount: &Amount) -> Result<ResolvedAmount> {
                         .join(", ")
                 )
             })?;
-            build(m, amount.value)
+            build(m, amount.value / units_in_name(m, unit))
         }
     };
     // JSON has no infinity: serde_json would send `"grams": null`.
@@ -507,6 +507,17 @@ pub fn resolve_amount(food: &Food, amount: &Amount) -> Result<ResolvedAmount> {
         bail!("{} of '{}' is too large to log", resolved.display, food.name);
     }
     Ok(resolved)
+}
+
+/// How many `unit`s one of this measure holds, per its name: "1/2 cup" holds
+/// half a cup and "2 slices" two slices, so "1 cup" is two "1/2 cup" measures.
+/// A name without a leading quantity for `unit` ("cup", or "12 fl oz can"
+/// when the unit is "can") holds one.
+fn units_in_name(m: &Measure, unit: &str) -> f64 {
+    match m.name.parse::<Amount>() {
+        Ok(named) if named.unit.as_deref().is_some_and(|u| u.starts_with(unit)) => named.value,
+        _ => 1.0,
+    }
 }
 
 /// The measure a literal weight is logged against: the food's own `unit`
