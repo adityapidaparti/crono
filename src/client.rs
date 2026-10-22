@@ -174,7 +174,7 @@ impl Client {
         }
         let value: Value = response.json().map_err(|_| anyhow!("Cronometer export returned invalid JSON"))?;
         if Self::is_auth_failure(&value) {
-            bail!("Cronometer rejected export; verify the session with a fresh login (no automatic retry)");
+            bail!("Cronometer rejected the saved session. Run `crono login <email>`, then export again. export never logs in by itself.");
         }
         Ok(value)
     }

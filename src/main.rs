@@ -48,15 +48,15 @@ enum Command {
         #[arg(long, default_value = "1")]
         pick: Pick,
     },
-    /// Show the diary for a day
+    /// Show the diary for a day: crono day yesterday, or crono day -d yesterday
     Day {
-        #[arg(default_value = "today", allow_hyphen_values = true)]
-        day: DaySpec,
+        #[command(flatten)]
+        when: DayArg,
     },
     /// Export original diary and food/nutrient metadata as JSON; cached session only
     Export {
-        #[arg(default_value = "today", allow_hyphen_values = true)]
-        day: DaySpec,
+        #[command(flatten)]
+        when: DayArg,
     },
     /// Remove a diary entry by serving id (ids shown by `crono day`)
     Rm {
@@ -69,6 +69,23 @@ enum Command {
         #[command(subcommand)]
         action: Option<SkillCmd>,
     },
+}
+
+/// A day, given as a bare word or with `-d` like `log` and `rm` take it.
+#[derive(clap::Args)]
+struct DayArg {
+    /// today|yesterday|tomorrow|-N|YYYY-MM-DD [default: today]
+    #[arg(value_name = "DAY", allow_hyphen_values = true)]
+    day: Option<DaySpec>,
+    /// The same day, as an option
+    #[arg(short = 'd', long = "day", value_name = "DAY", allow_hyphen_values = true, conflicts_with = "day")]
+    day_option: Option<DaySpec>,
+}
+
+impl DayArg {
+    fn get(self) -> DaySpec {
+        self.day.or(self.day_option).unwrap_or(DaySpec::Today)
+    }
 }
 
 #[derive(Subcommand)]
@@ -96,10 +113,10 @@ fn main() -> Result<()> {
         Command::Log { query, amount, meal, day, pick } => {
             cmd_log(&mut client, &query.join(" "), &amount, meal, day, pick)
         }
-        Command::Day { day } => cmd_day(&mut client, day),
-        Command::Export { day } => {
+        Command::Day { when } => cmd_day(&mut client, when.get()),
+        Command::Export { when } => {
             let (today, _) = client.account_now()?;
-            let snapshot = client.export_day(day.resolve(today).map_err(anyhow::Error::msg)?)?;
+            let snapshot = client.export_day(when.get().resolve(today).map_err(anyhow::Error::msg)?)?;
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
             Ok(())
         },

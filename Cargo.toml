@@ -2,6 +2,7 @@
 name = "crono"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 description = "Fast local CLI for logging food to Cronometer (no background process)"
 
 [dependencies]

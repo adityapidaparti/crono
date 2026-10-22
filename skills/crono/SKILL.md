@@ -27,7 +27,7 @@ crono matches a unit to the food's measures by exact name, then by a name that s
 
 Meals are `-m breakfast`, `lunch`, `dinner`, `snacks` or `uncategorized`, or their first letters. Without `-m`, crono picks by the hour in the account's timezone: 04 to 09 breakfast, 10 to 13 lunch, 14 to 20 dinner, and snacks otherwise. Pass `-m` whenever the user named a meal.
 
-Days are `-d today`, `yesterday`, `tomorrow`, `-N` for N days ago, or `YYYY-MM-DD`, in the account's timezone.
+Days are `-d today`, `yesterday`, `tomorrow`, `-N` for N days ago, or `YYYY-MM-DD`, in the account's timezone. Every command that takes a day accepts `-d`, and `crono day` and `crono export` also take the day without it.
 
 ## Rules
 

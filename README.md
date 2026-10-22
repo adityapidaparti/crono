@@ -9,7 +9,7 @@ logged: Fage, Total 2% Greek Yogurt, Plain — 0.75 × cup → breakfast on 2026
 
 ## Install
 
-You need [Rust](https://rustup.rs).
+You need [Rust](https://rustup.rs) 1.88 or newer.
 
 ```sh
 cargo install --locked --git https://github.com/adityapidaparti/crono
@@ -34,6 +34,7 @@ crono food 455994                           # its measures and macros
 crono log hummus -a 120g -m dinner          # log the top search result
 crono log '#455994' -a "2 tbsp" -d yesterday
 crono day                                   # today's diary, with calories
+crono day -d yesterday                      # any command that takes a day accepts -d
 crono rm 5300000001                         # remove an entry, by the id `crono day` shows
 crono export yesterday > day.json           # a day's raw diary and nutrient data
 ```
