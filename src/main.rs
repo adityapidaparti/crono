@@ -1,11 +1,10 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
-use std::collections::BTreeMap;
 
-use crono::client::{estimate_kcal, resolve_amount, Client, Food, NUTRIENT_CARBS, NUTRIENT_FAT, NUTRIENT_PROTEIN};
+use crono::client::{estimate_kcal, resolve_amount, Client, NUTRIENT_CARBS, NUTRIENT_FAT, NUTRIENT_PROTEIN};
 use crono::session::{self, Credentials};
-use crono::types::{Amount, DaySpec, Meal};
+use crono::types::{Amount, DaySpec, Meal, Pick};
 
 #[derive(Parser)]
 #[command(name = "crono", about = "Log food to Cronometer from the terminal", version)]
@@ -46,8 +45,8 @@ enum Command {
         #[arg(short, long, default_value = "today", allow_hyphen_values = true)]
         day: DaySpec,
         /// Pick the Nth search result instead of the 1st (1-based)
-        #[arg(long, default_value_t = 1)]
-        pick: usize,
+        #[arg(long, default_value = "1")]
+        pick: Pick,
     },
     /// Show the diary for a day
     Day {
@@ -99,7 +98,7 @@ fn main() -> Result<()> {
         }
         Command::Day { day } => cmd_day(&mut client, day),
         Command::Export { day } => {
-            let (today, _) = client.account_now();
+            let (today, _) = client.account_now()?;
             let snapshot = client.export_day(day.resolve(today).map_err(anyhow::Error::msg)?)?;
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
             Ok(())
@@ -116,7 +115,7 @@ fn cmd_login(client: &mut Client, email: &str, remember: bool) -> Result<()> {
         _ => rpassword::prompt_password("Cronometer password: ")?,
     };
     let state = client.login(email, &password)?;
-    println!("logged in as user {} (timezone {})", state.user_id, state.timezone);
+    println!("logged in as user {} (timezone {})", state.user_id, state.timezone.as_deref().unwrap_or("unknown"));
     if remember {
         let path = session::save_credentials(&Credentials {
             username: email.to_string(),
@@ -170,20 +169,20 @@ fn cmd_log(
     amount: &Amount,
     meal: Option<Meal>,
     day: DaySpec,
-    pick: usize,
+    pick: Pick,
 ) -> Result<()> {
     let food = if let Some(id) = query.strip_prefix('#').and_then(|s| s.parse::<i64>().ok()) {
         client.get_food(id)?
     } else {
         let results = client.search(query)?;
         let hit = results
-            .get(pick.saturating_sub(1))
+            .get(pick.index())
             .with_context(|| format!("no search result #{pick} for '{query}'"))?;
         client.get_food(hit.id)?
     };
 
     let resolved = resolve_amount(&food, amount)?;
-    let (today, now) = client.account_now();
+    let (today, now) = client.account_now()?;
     let date = day.resolve(today).map_err(anyhow::Error::msg)?;
     let meal = meal.unwrap_or_else(|| Meal::from_hour(chrono::Timelike::hour(&now)));
 
@@ -196,77 +195,24 @@ fn cmd_log(
 }
 
 fn cmd_day(client: &mut Client, day: DaySpec) -> Result<()> {
-    let (today, _) = client.account_now();
+    let (today, _) = client.account_now()?;
     let date = day.resolve(today).map_err(anyhow::Error::msg)?;
     let entries = client.get_diary(date)?;
-    let servings: Vec<&Value> = entries
+    let food_ids: Vec<i64> = entries
         .iter()
         .filter(|e| e.get("type").and_then(Value::as_str) == Some("Serving"))
-        .collect();
-    if servings.is_empty() {
-        println!("{date}: no food logged");
-        return Ok(());
-    }
-
-    let food_ids: Vec<i64> = servings
-        .iter()
         .filter_map(|e| e.get("foodId").and_then(Value::as_i64))
         .collect();
-    let foods: BTreeMap<i64, Food> = client
-        .get_foods(&food_ids)?
-        .into_iter()
-        .map(|f| (f.id, f))
-        .collect();
-
-    let mut by_meal: BTreeMap<u32, Vec<String>> = BTreeMap::new();
-    let mut total_kcal = 0.0;
-    for e in &servings {
-        let food_id = e.get("foodId").and_then(Value::as_i64).unwrap_or(0);
-        let serving_id = e.get("servingId").and_then(Value::as_i64).unwrap_or(0);
-        let grams = e.get("grams").and_then(Value::as_f64).unwrap_or(0.0);
-        let order = e.get("order").and_then(Value::as_i64).unwrap_or(0);
-        let meal = Meal::from_order(order);
-        let (name, kcal) = match foods.get(&food_id) {
-            Some(f) => {
-                let measure_id = e.get("measureId").and_then(Value::as_i64).unwrap_or(0);
-                let is_recipe = f.measure(measure_id).map(|m| m.kind == "Recipe").unwrap_or(false);
-                let kcal = f
-                    .nutrient(crono::client::NUTRIENT_ENERGY_KCAL)
-                    .map(|k| if is_recipe { k * grams } else { k * grams / 100.0 });
-                (f.name.clone(), kcal)
-            }
-            None => (format!("food #{food_id}"), None),
-        };
-        total_kcal += kcal.unwrap_or(0.0);
-        let kcal_str = kcal.map(|k| format!("{k:>6.0} kcal")).unwrap_or_else(|| "     ?".into());
-        by_meal
-            .entry(meal.group_number())
-            .or_default()
-            .push(format!("  [{serving_id}] {name} — {grams:.0} g  {kcal_str}"));
-    }
-
-    println!("{date}");
-    for (group, lines) in by_meal {
-        println!("{}:", Meal::from_group_number(group));
-        for line in lines {
-            println!("{line}");
-        }
-    }
-    println!("total ≈ {total_kcal:.0} kcal");
+    let foods = client.get_foods(&food_ids)?;
+    print!("{}", crono::diary::render_day(date, &entries, &foods));
     Ok(())
 }
 
 fn cmd_rm(client: &mut Client, entry_id: i64, day: DaySpec) -> Result<()> {
-    let (today, _) = client.account_now();
+    let (today, _) = client.account_now()?;
     let date = day.resolve(today).map_err(anyhow::Error::msg)?;
     let entries = client.get_diary(date)?;
-    let target: Vec<Value> = entries
-        .into_iter()
-        .filter(|e| {
-            e.get("servingId").and_then(Value::as_i64) == Some(entry_id)
-                || e.get("id").and_then(Value::as_i64) == Some(entry_id)
-        })
-        .collect();
+    let target = crono::diary::entries_to_remove(entries, entry_id);
     if target.is_empty() {
         bail!("no entry {entry_id} on {date} (see `crono day {date}` for ids)");
     }

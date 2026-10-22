@@ -21,7 +21,7 @@ Run `crono day`. If it fails with a login or session error, such as "session exp
 
 If `log` or `rm` fails, the change may still have reached Cronometer. Before retrying, check for the entry in `crono export <day>`, which fails rather than showing an empty diary when Cronometer's answer is incomplete. If the export fails or you still can't tell, stop and tell the user.
 
-Amounts are `120g`, `5oz`, `1.5 cup`, `3/4 cup`, `"1 1/2 cup"`, or a bare number such as `2` for two of the food's default measure. Quote an amount that contains a space. Without `-a`, crono logs one default measure.
+Amounts are `120g`, `5oz`, `1.5 cup`, `3/4 cup`, `"1 1/2 cup"`, `"1 ½ cup"`, or a bare number such as `2` for two of the food's default measure. Quote an amount that contains a space. Without `-a`, crono logs one default measure.
 
 crono matches a unit to the food's measures by exact name, then by a name that starts with it, then by one that contains it. A measure named with a quantity counts as that much: if the only cup measure is "1/2 cup", `-a "1 cup"` logs two of it. Check `crono food <id>` when the portion matters.
 
@@ -36,7 +36,7 @@ Days are `-d today`, `yesterday`, `tomorrow`, `-N` for N days ago, or `YYYY-MM-D
 - If crono says "no measure matching", show the measures it lists and ask which one, or use a weight if the user gave one.
 - Remove only entries you logged in this conversation, or ones the user points to. Get the id from `crono day`, confirm it, then run `crono rm <id> -d <day>`.
 - Don't use `log` or `rm` to test whether crono works. `crono day` and `crono search` are enough.
-- The calories crono prints are estimates. `crono day` shows `?` for an entry it can't estimate and leaves it out of the total. Cronometer's own app is the source of truth.
+- The calories crono prints are estimates. `crono day` shows `?` for an entry it can't estimate and leaves it out of the total, which then says how many entries it left out. It shows a recipe entry in servings, not grams. Cronometer's own app is the source of truth.
 - `crono export <day>` prints the day's raw diary and each food's full nutrient data as JSON, and never logs in. Check `missing_food_ids` before treating the food data as complete.
 
 ## Updating this skill

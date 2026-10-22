@@ -8,18 +8,18 @@
 //! `cargo test --test properties` runs them (case counts are in `hegel.toml`);
 //! `HEGEL_TEST_CASES=20000 cargo test --test properties` digs deeper.
 //!
-//! Not covered here, because the logic lives inline in `src/main.rs` or behind
-//! the network: which entries `crono rm` deletes, `--pick`, `crono day` totals,
-//! the account-timezone clock, and the HTTP/session layer.
+//! Not covered here, because it sits behind the network: the HTTP and session
+//! layer.
 
 use std::collections::{BTreeSet, HashMap};
 
-use chrono::{Datelike, NaiveDate, Timelike};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Timelike, Utc};
 use crono::client::{
-    build_diary_export, estimate_kcal, find_measure, resolve_amount, Food, Measure,
-    NutrientAmount, NUTRIENT_ENERGY_KCAL,
+    account_clock, build_diary_export, estimate_kcal, find_measure, resolve_amount, Food, Measure,
+    serving_payload, NutrientAmount, NUTRIENT_ENERGY_KCAL,
 };
-use crono::types::{cron_day, cron_time, parse_cron_day, Amount, DaySpec, Meal};
+use crono::diary::{entries_to_remove, render_day};
+use crono::types::{cron_day, cron_time, parse_cron_day, Amount, DaySpec, Meal, Pick};
 use hegel::extras::chrono as chrono_gs;
 use hegel::extras::serde_json as json_gs;
 use hegel::prelude::*;
@@ -76,13 +76,13 @@ fn unit_words(tc: &TestCase) -> String {
 }
 
 /// A unit that can follow a number: it doesn't start with whitespace or with
-/// something number-like (a digit, '.', ',' or '/'), which crono reads as
-/// part of the number or rejects.
+/// something number-like (a digit, '.', ',', '/' or a fraction like '½'),
+/// which crono reads as part of the number or rejects.
 #[hegel::composite]
 fn typed_units(tc: &TestCase) -> String {
     tc.draw(hegel::one_of!(
         gs::sampled_from(UNIT_WORDS).map(|w: &str| w.to_string()),
-        gs::from_regex(r"[^0-9.,/\s].*"),
+        gs::from_regex(r"[^0-9.,/\s½⅓⅔¼¾⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞].*"),
     ))
 }
 
@@ -95,11 +95,13 @@ fn lowercase_units(tc: &TestCase) -> String {
     ))
 }
 
-/// Something shaped like an amount: a number (maybe a fraction like 3/4 or
-/// 1 1/2, maybe malformed), spacing, maybe a unit.
+/// Something shaped like an amount: a number (maybe a fraction like 3/4,
+/// 1 1/2, 1 / 2 or 1 ½, maybe malformed), spacing, maybe a unit.
 #[hegel::composite]
 fn typed_amounts(tc: &TestCase) -> String {
-    let number = tc.draw(gs::from_regex(r"[0-9]*\.?[0-9]*( *[0-9]*\.?[0-9]*/[0-9]*\.?[0-9]*)?"));
+    let number = tc.draw(gs::from_regex(
+        r"[0-9]*\.?[0-9]*( *[0-9]*\.?[0-9]* */ *[0-9]*\.?[0-9]*)?( *[½⅓⅔¼¾⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞])?",
+    ));
     let spacing = tc.draw(whitespace());
     let unit = tc.draw(hegel::one_of!(gs::just(String::new()), typed_units()));
     format!("{number}{spacing}{unit}")
@@ -264,8 +266,8 @@ fn zero_and_negative_amounts_are_rejected(tc: TestCase) {
     assert!(typed.parse::<Amount>().is_err(), "{typed:?} was accepted");
 }
 
-/// An amount must start with a number: "cup", "a few", "½ cup" are rejected
-/// rather than guessed at.
+/// An amount must start with a number or a fraction like "½": "cup" and
+/// "a few" are rejected rather than guessed at.
 #[hegel::test]
 fn amounts_must_start_with_a_number(tc: TestCase) {
     let typed = format!("{}{}", tc.draw(whitespace()), tc.draw(typed_units()));
@@ -403,6 +405,51 @@ fn a_zero_denominator_is_rejected(tc: TestCase) {
     let unit = tc.draw(hegel::one_of!(gs::just(String::new()), typed_units()));
     let typed = format!("{top}/0{unit}");
     assert!(typed.parse::<Amount>().is_err(), "{typed:?} was accepted");
+}
+
+/// Spaces around a fraction's slash don't change it: "1 / 2 cup" is
+/// "1/2 cup" and "1 1 / 2 cup" is "1 1/2 cup", or both are rejected.
+#[hegel::test]
+fn spaces_around_a_fractions_slash_do_not_change_it(tc: TestCase) {
+    let whole = tc.draw(gs::optional(gs::from_regex(r"[0-9]+")));
+    let top = tc.draw(gs::from_regex(r"[0-9]+(\.[0-9]+)?"));
+    let bottom = tc.draw(gs::from_regex(r"[0-9]+(\.[0-9]+)?"));
+    let slash = format!("{}/{}", tc.draw(whitespace()), tc.draw(whitespace()));
+    let spacing = tc.draw(whitespace());
+    let unit = tc.draw(hegel::one_of!(gs::just(String::new()), typed_units()));
+    let typed = |slash: &str| {
+        let fraction = format!("{top}{slash}{bottom}{spacing}{unit}");
+        match &whole {
+            Some(whole) => format!("{whole} {fraction}"),
+            None => fraction,
+        }
+    };
+    let (tidy, spaced) = (typed("/"), typed(&slash));
+    assert_eq!(spaced.parse::<Amount>().ok(), tidy.parse::<Amount>().ok(), "{spaced:?} vs {tidy:?}");
+}
+
+/// The Unicode fractions crono reads, and how they're typed out.
+const UNICODE_FRACTIONS: &[(char, &str)] = &[
+    ('½', "1/2"), ('⅓', "1/3"), ('⅔', "2/3"), ('¼', "1/4"), ('¾', "3/4"),
+    ('⅕', "1/5"), ('⅖', "2/5"), ('⅗', "3/5"), ('⅘', "4/5"), ('⅙', "1/6"),
+    ('⅚', "5/6"), ('⅛', "1/8"), ('⅜', "3/8"), ('⅝', "5/8"), ('⅞', "7/8"),
+];
+
+/// A Unicode fraction means the same as typing it out: "½ cup" is "1/2 cup",
+/// and "1 ½ cup" or "1½ cup" is "1 1/2 cup", not one of some "½ cup" measure.
+#[hegel::test]
+fn unicode_fractions_mean_the_same_as_typed_ones(tc: TestCase) {
+    let (glyph, written) = tc.draw(gs::sampled_from(UNICODE_FRACTIONS));
+    let whole = tc.draw(gs::optional(gs::integers::<u32>()));
+    let gap = tc.draw(whitespace());
+    let spacing = tc.draw(whitespace());
+    let unit = tc.draw(hegel::one_of!(gs::just(String::new()), typed_units()));
+    let (with_glyph, written_out) = match whole {
+        Some(whole) => (format!("{whole}{gap}{glyph}{spacing}{unit}"), format!("{whole} {written}{spacing}{unit}")),
+        None => (format!("{glyph}{spacing}{unit}"), format!("{written}{spacing}{unit}")),
+    };
+    let expected: Amount = written_out.parse().unwrap();
+    assert_eq!(with_glyph.parse::<Amount>(), Ok(expected), "{with_glyph:?} vs {written_out:?}");
 }
 
 /// Typing a fraction ("3/4 cup", "1 1/2 cup") logs exactly that many cups,
@@ -737,7 +784,8 @@ fn the_automatic_meal_follows_the_readme_schedule() {
 // Logging: turning an amount into what gets sent
 //
 // `crono log` sends `resolve_amount`'s `measure_id` and `grams` to Cronometer
-// unchanged (client.rs `add_serving`), so these check what Cronometer receives.
+// unchanged (client.rs `serving_payload`, checked below), so these check what
+// Cronometer receives.
 // ---------------------------------------------------------------------------
 
 /// "N g" (or gram/grams) sends exactly N grams, whatever measures the food
@@ -795,6 +843,47 @@ fn recipe_only_foods_cannot_be_logged_by_weight(tc: TestCase) {
     let word = tc.draw(gs::sampled_from(&["g", "gram", "grams", "oz", "ounce", "ounces"][..]));
     let result = resolve_amount(&food, &Amount::new(quantity, Some(word)));
     assert!(result.is_err(), "\"{quantity} {word}\" → {result:?}");
+}
+
+/// Logging a weight ("120 g", "5 oz") points the entry at the food's best
+/// match for that unit among the measures that aren't recipe servings, even
+/// when a recipe serving's name matches the unit better ("g" beside "100 g").
+#[hegel::test]
+fn a_weight_uses_the_best_matching_measure_that_is_not_a_recipe_serving(tc: TestCase) {
+    let mut food = tc.draw(foods(0));
+    let (word, unit) = tc.draw(gs::sampled_from(
+        &[("g", "g"), ("gram", "g"), ("grams", "g"), ("oz", "oz"), ("ounce", "oz"), ("ounces", "oz")][..],
+    ));
+    let (recipe_id, weight_id) = (tc.draw(gs::integers::<i64>()), tc.draw(gs::integers::<i64>()));
+    tc.assume(recipe_id != weight_id && !food.measures.iter().any(|m| m.id == recipe_id || m.id == weight_id));
+    // A recipe serving named the unit, or starting with it, so it ranks first.
+    let recipe_name = format!("{}{}", draw_capitalization(&tc, unit), tc.draw(gs::from_regex(r"[a-z ,]*")));
+    let weight_name = format!(
+        "{}{}{}",
+        tc.draw(gs::from_regex(r"[a-z0-9 ,]*")),
+        draw_capitalization(&tc, unit),
+        tc.draw(gs::from_regex(r"[a-z0-9 ,]*"))
+    );
+    let weight_kind = tc.draw(hegel::one_of!(
+        gs::sampled_from(MEASURE_KINDS).map(|k: &str| k.to_string()),
+        gs::text(),
+    ));
+    tc.assume(weight_kind != "Recipe");
+    let planted = [
+        Measure { kind: "Recipe".into(), ..measure(recipe_id, &recipe_name) },
+        Measure { kind: weight_kind, value: tc.draw(finite_numbers()), ..measure(weight_id, &weight_name) },
+    ];
+    for m in planted {
+        let at = tc.draw(gs::integers::<usize>().max_value(food.measures.len()));
+        food.measures.insert(at, m);
+    }
+    let measure_ids: Vec<i64> = food.measures.iter().map(|m| m.id).collect();
+    food.default_measure_id = tc.draw(hegel::one_of!(gs::sampled_from(measure_ids), ids()));
+    let weighable = food_with(food.measures.iter().filter(|m| m.kind != "Recipe").cloned().collect());
+    let expected = find_measure(&weighable, unit).expect("the planted measure matches").id;
+    let quantity = tc.draw(positive_amounts().max_value(1e300));
+    let resolved = resolve_amount(&food, &Amount::new(quantity, Some(word))).unwrap();
+    assert_eq!(resolved.measure_id, expected, "\"{quantity} {word}\" against {:?}", food.measures);
 }
 
 /// Logging by weight (g, oz) never points the entry at a recipe's serving
@@ -1009,6 +1098,35 @@ fn entries_count_servings_exactly_when_they_point_at_a_recipe_measure(tc: TestCa
     }
 }
 
+/// What `crono log` sends to Cronometer's add_serving: the food, the measure
+/// and grams the amount resolved to, the meal it's filed under, and the day
+/// written YYYY-M-D without leading zeros.
+#[hegel::test]
+fn a_logged_serving_carries_the_food_measure_grams_meal_and_day(tc: TestCase) {
+    let food = tc.draw(foods(1));
+    let names: Vec<String> = food.measures.iter().map(|m| m.name.clone()).collect();
+    let unit = tc.draw(hegel::one_of!(
+        gs::just(None),
+        gs::sampled_from(&["g", "grams", "oz", "ounces"][..]).map(|w: &str| Some(w.to_string())),
+        gs::sampled_from(names).map(Some),
+    ));
+    let count = tc.draw(positive_amounts());
+    let Ok(resolved) = resolve_amount(&food, &Amount::new(count, unit.as_deref())) else { tc.reject() };
+    let meal = tc.draw(gs::sampled_from(&Meal::ALL[..]));
+    let (day, time) = (tc.draw(any_date()), tc.draw(chrono_gs::naive_times()));
+    let body = serving_payload(tc.draw(gs::integers::<i64>()), food.id, &resolved, meal, day, time);
+    let serving = &body["serving"];
+    let sent = (
+        serving["foodId"].as_i64(),
+        serving["measureId"].as_i64(),
+        serving["grams"].as_f64(),
+        serving["order"].as_i64().map(Meal::from_order),
+        serving["day"].as_str().map(str::to_string),
+    );
+    let day_written = format!("{}-{}-{}", day.year(), day.month(), day.day());
+    assert_eq!(sent, (Some(food.id), Some(resolved.measure_id), Some(resolved.grams), Some(meal), Some(day_written)));
+}
+
 /// For a food without Recipe measures (so its calorie label is per 100 g),
 /// the calories crono estimates for N g are the label × N ÷ 100. The label
 /// is planted among the food's other nutrients so the test knows its value.
@@ -1181,4 +1299,230 @@ fn export_is_labelled_with_its_day_and_account(tc: TestCase) {
     assert_eq!(export["day"].as_str().map(str::parse::<NaiveDate>), Some(Ok(day)));
     assert_eq!(export["account"]["user_id"], json!(user_id));
     assert_eq!(export["account"]["timezone"], json!(timezone));
+}
+
+// ---------------------------------------------------------------------------
+// Removing entries: `crono rm <id>`
+// ---------------------------------------------------------------------------
+
+/// A diary object of any type whose `servingId` and `id` often equal `target`.
+#[hegel::composite]
+fn entries_near(tc: &TestCase, target: i64) -> Value {
+    let mut entry = tc.draw(extra_fields());
+    let kind = tc.draw(hegel::one_of!(
+        gs::sampled_from(ENTRY_TYPES).map(|t: &str| t.to_string()),
+        gs::text(),
+    ));
+    entry.insert("type".into(), json!(kind));
+    for key in ["servingId", "id"] {
+        if let Some(id) = tc.draw(gs::optional(hegel::one_of!(gs::just(target), ids()))) {
+            entry.insert(key.into(), json!(id));
+        }
+    }
+    Value::Object(entry)
+}
+
+/// `crono rm <id>` deletes exactly the food entries (type "Serving") whose
+/// `servingId` is that id, the id `crono day` shows, and sends them unchanged.
+/// An exercise or note whose own `id` matches, or a food entry whose `id` but
+/// not `servingId` matches, stays in the diary.
+#[hegel::test]
+fn rm_deletes_only_the_food_entries_with_that_serving_id(tc: TestCase) {
+    let target = tc.draw(ids());
+    let mut entries = tc.draw(gs::vecs(entries_near(target)));
+    let other = target.wrapping_add(tc.draw(gs::integers::<i64>().min_value(1)));
+    let not_food = &["Exercise", "Note", "Biometric", "Fasting", "serving", ""][..];
+    let decoys = [
+        json!({"type": tc.draw(gs::sampled_from(not_food)), "id": target}),
+        json!({"type": tc.draw(gs::sampled_from(not_food)), "servingId": target}),
+        json!({"type": "Serving", "id": target, "servingId": other}),
+    ];
+    for decoy in decoys {
+        let at = tc.draw(gs::integers::<usize>().max_value(entries.len()));
+        entries.insert(at, decoy);
+    }
+    let expected: Vec<Value> = entries
+        .iter()
+        .filter(|e| e["type"] == "Serving" && e["servingId"].as_i64() == Some(target))
+        .cloned()
+        .collect();
+    assert_eq!(entries_to_remove(entries, target), expected);
+}
+
+// ---------------------------------------------------------------------------
+// Picking a search result: `crono log --pick N`
+// ---------------------------------------------------------------------------
+
+/// `--pick N` logs the Nth search result, counting from 1 ("007" is the
+/// seventh), and `--pick 0` is refused when typed rather than read as the
+/// first result.
+#[hegel::test]
+fn pick_n_logs_the_nth_result_and_there_is_no_zeroth(tc: TestCase) {
+    let zeros = tc.draw(gs::from_regex(r"0*"));
+    let n = tc.draw(hegel::one_of!(gs::just(0usize), gs::integers::<usize>()));
+    let typed = format!("{zeros}{n}");
+    assert_eq!(typed.parse::<Pick>().map(|p| p.index()).ok(), n.checked_sub(1), "--pick {typed}");
+}
+
+// ---------------------------------------------------------------------------
+// Reading a day back: `crono day`
+// ---------------------------------------------------------------------------
+
+/// The foods `get_foods` describes for a day, each id once.
+#[hegel::composite]
+fn described_foods(tc: &TestCase, min_foods: usize) -> Vec<Food> {
+    let mut seen = BTreeSet::new();
+    tc.draw(gs::vecs(foods(1)).min_size(min_foods)).into_iter().filter(|f| seen.insert(f.id)).collect()
+}
+
+/// A food entry as `get_diary` returns it, for one of `foods` and one of its
+/// measures, or for a food or measure the day's food data doesn't describe.
+fn draw_food_entry(tc: &TestCase, foods: &[Food]) -> Value {
+    let (food_id, measure_id) = if !foods.is_empty() && tc.draw(gs::booleans()) {
+        let food = &foods[tc.draw(gs::integers::<usize>().max_value(foods.len() - 1))];
+        let measure_ids: Vec<i64> = food.measures.iter().map(|m| m.id).collect();
+        (food.id, tc.draw(hegel::one_of!(gs::sampled_from(measure_ids), ids())))
+    } else {
+        (tc.draw(ids()), tc.draw(ids()))
+    };
+    let mut entry = tc.draw(extra_fields());
+    for (key, value) in [
+        ("type", json!("Serving")),
+        ("servingId", json!(tc.draw(ids()))),
+        ("foodId", json!(food_id)),
+        ("measureId", json!(measure_id)),
+        ("grams", json!(tc.draw(finite_numbers()))),
+        ("order", json!(tc.draw(gs::integers::<i64>()))),
+    ] {
+        entry.insert(key.into(), value);
+    }
+    Value::Object(entry)
+}
+
+/// A day's diary: at least `min_food` food entries for `foods`, with other
+/// entries (exercise, notes, unknown types) mixed in.
+fn draw_day(tc: &TestCase, foods: &[Food], min_food: usize) -> Vec<Value> {
+    let mut entries = tc.draw(gs::vecs(diary_entries()));
+    let food_entries = tc.draw(gs::integers::<usize>().min_value(min_food).max_value(min_food + 8));
+    for _ in 0..food_entries {
+        let at = tc.draw(gs::integers::<usize>().max_value(entries.len()));
+        entries.insert(at, draw_food_entry(tc, foods));
+    }
+    entries
+}
+
+/// `crono day` shows an entry that points at a recipe's serving measure as
+/// its number of servings, since that is what Cronometer stores in `grams`
+/// for a recipe; "2 g" there would really mean 2 servings.
+#[hegel::test]
+fn the_day_shows_recipe_entries_as_servings(tc: TestCase) {
+    let mut foods = tc.draw(described_foods(1));
+    let mut entries = draw_day(&tc, &foods, 0);
+    let at = tc.draw(gs::integers::<usize>().max_value(foods.len() - 1));
+    let food = &mut foods[at];
+    let at = tc.draw(gs::integers::<usize>().max_value(food.measures.len() - 1));
+    let recipe = &mut food.measures[at];
+    recipe.kind = "Recipe".into();
+    let (food_id, measure_id) = (food.id, recipe.id);
+    let listed_as = food.name.clone();
+    let serving_id = tc.draw(ids());
+    // Keep the entry's line unique; one without a servingId is listed as [0].
+    entries.retain(|e| e["type"] != "Serving" || e["servingId"].as_i64().unwrap_or(0) != serving_id);
+    let servings = tc.draw(finite_numbers());
+    let entry = json!({"type": "Serving", "servingId": serving_id, "foodId": food_id,
+        "measureId": measure_id, "grams": servings, "order": tc.draw(gs::integers::<i64>())});
+    let at = tc.draw(gs::integers::<usize>().max_value(entries.len()));
+    entries.insert(at, entry);
+    let shown = render_day(tc.draw(any_date()), &entries, &foods);
+    let listed = format!("[{serving_id}] {listed_as} — ");
+    let quantity = shown.split_once(&listed).expect("the entry is listed").1.lines().next().unwrap_or("");
+    let mut words = quantity.split_whitespace();
+    let count: f64 = words.next().and_then(|n| n.parse().ok()).expect("a number");
+    let label = words.next();
+    assert!(matches!(label, Some("serving" | "servings")), "{servings} servings shown as {quantity:?}");
+    assert!((count - servings).abs() <= 0.005 + servings.abs() * f64::EPSILON, "{servings} servings shown as {quantity:?}");
+}
+
+/// `crono day`'s total leaves out entries it can't estimate (shown as `?`:
+/// no calorie data, or a food Cronometer didn't describe), and says how many
+/// it left out, so a partial total isn't mistaken for the whole day.
+#[hegel::test]
+fn the_day_total_says_how_many_entries_have_no_calorie_estimate(tc: TestCase) {
+    let foods = tc.draw(described_foods(0));
+    let entries = draw_day(&tc, &foods, 1);
+    let unknown = entries
+        .iter()
+        .filter(|e| e["type"] == "Serving")
+        .filter(|e| {
+            let food = foods.iter().find(|f| e["foodId"].as_i64() == Some(f.id));
+            food.and_then(|f| f.nutrient(NUTRIENT_ENERGY_KCAL)).is_none()
+        })
+        .count();
+    let note = match unknown {
+        0 => String::new(),
+        1 => " (1 entry without calories)".into(),
+        n => format!(" ({n} entries without calories)"),
+    };
+    let shown = render_day(tc.draw(any_date()), &entries, &foods);
+    let total = shown.lines().last().unwrap_or("");
+    assert!(total.starts_with("total ≈ ") && total.ends_with(&format!(" kcal{note}")), "{total:?} with {unknown} unestimated");
+}
+
+// ---------------------------------------------------------------------------
+// The account's clock: which day and meal `log`, `rm` and `day` mean
+// ---------------------------------------------------------------------------
+
+/// Timezone names chrono-tz knows, as Cronometer's login returns them.
+fn known_timezones() -> impl PrintableGenerator<String> {
+    gs::sampled_from(chrono_tz::TZ_VARIANTS.iter().map(|tz| tz.name().to_string()).collect::<Vec<_>>())
+}
+
+/// Real timezone names, slightly off: recased, padded, or with a letter added.
+#[hegel::composite]
+fn near_miss_timezones(tc: &TestCase) -> String {
+    let name = tc.draw(known_timezones());
+    match tc.draw(gs::integers::<u8>().max_value(2)) {
+        0 => draw_capitalization(tc, &name),
+        1 => format!("{}{name}{}", tc.draw(whitespace()), tc.draw(whitespace())),
+        _ => format!("{name}{}", tc.draw(gs::from_regex(r"[a-z]"))),
+    }
+}
+
+/// Any moment crono might run, in UTC.
+fn draw_moment(tc: &TestCase) -> DateTime<Utc> {
+    tc.draw(any_date()).and_time(tc.draw(chrono_gs::naive_times())).and_utc()
+}
+
+/// A saved session with no timezone, or one chrono-tz doesn't know (a typo,
+/// different capitals, stray spaces), makes `log`, `rm` and `day` stop and
+/// ask you to log in again, rather than guess UTC or the computer's clock
+/// and file food under the wrong day.
+#[hegel::test]
+fn a_session_without_a_known_timezone_is_refused_rather_than_guessed(tc: TestCase) {
+    let timezone = tc.draw(hegel::one_of!(
+        gs::just(None::<String>),
+        gs::text().map(Some),
+        near_miss_timezones().map(Some),
+    ));
+    if let Some(name) = &timezone {
+        tc.assume(name.parse::<chrono_tz::Tz>().is_err());
+    }
+    let now = draw_moment(&tc);
+    match account_clock(timezone.as_deref(), now) {
+        Ok(guess) => panic!("timezone {timezone:?} at {now} guessed {guess:?}"),
+        Err(error) => assert!(error.to_string().contains("log in again"), "{error}"),
+    }
+}
+
+/// With a timezone chrono-tz knows, the day and hour crono files food under
+/// are the account's local date and time at that moment.
+#[hegel::test]
+fn the_account_clock_is_the_local_time_in_the_accounts_timezone(tc: TestCase) {
+    let name = tc.draw(known_timezones());
+    let tz: chrono_tz::Tz = name.parse().unwrap();
+    let now = draw_moment(&tc);
+    let (date, time) = account_clock(Some(&name), now).unwrap();
+    let local = tz.from_local_datetime(&date.and_time(time));
+    let instants = [local.earliest(), local.latest()].map(|t| t.map(|t| t.with_timezone(&Utc)));
+    assert!(instants.contains(&Some(now)), "{now} in {name} read as {date} {time}");
 }

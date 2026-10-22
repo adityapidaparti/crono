@@ -135,16 +135,13 @@ impl FromStr for Amount {
     type Err = String;
 
     /// Accepts `"120g"`, `"1.5 cup"`, `"5 oz"`, `"2"`, `"0.5 sandwich"`, and
-    /// fractions: `"3/4 cup"`, `"1 1/2 cup"`.
+    /// fractions: `"3/4 cup"`, `"1 1/2 cup"`, `"1 / 2 cup"`, `"½ cup"`, `"1 ½ cup"`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
         if s.is_empty() {
             return Err("empty amount".into());
         }
         let (num, rest) = split_number(s);
-        if num.is_empty() {
-            return Err(format!("amount '{s}' must start with a number"));
-        }
         let number = |n: &str| {
             n.parse::<f64>()
                 .map_err(|_| format!("bad number '{n}' in amount '{s}'"))
@@ -153,9 +150,13 @@ impl FromStr for Amount {
             true => Err(format!("fractions take whole numbers, got '{n}' in amount '{s}'")),
             false => number(n),
         };
-        let (value, rest) = if let Some(after) = rest.strip_prefix('/') {
-            let (den, rest) = split_number(after);
+        let (value, rest) = if num.is_empty() {
+            leading_vulgar(rest).ok_or_else(|| format!("amount '{s}' must start with a number"))?
+        } else if let Some(after) = rest.trim_start().strip_prefix('/') {
+            let (den, rest) = split_number(after.trim_start());
             (whole(num)? / whole(den)?, rest)
+        } else if let Some((part, rest)) = leading_vulgar(rest.trim_start()) {
+            (whole(num)? + part, rest)
         } else if let Some((top, den, rest)) = leading_fraction(rest) {
             (whole(num)? + whole(top)? / whole(den)?, rest)
         } else {
@@ -167,7 +168,8 @@ impl FromStr for Amount {
         let unit = rest.trim();
         // A unit that starts like a number ("1,5 cup", "2 .5 cup") would
         // otherwise be matched as a measure name and log the wrong quantity.
-        if let Some(c) = unit.chars().next().filter(|c| c.is_ascii_digit() || ".,/".contains(*c)) {
+        let number_like = |c: &char| c.is_ascii_digit() || ".,/".contains(*c) || leading_vulgar(&c.to_string()).is_some();
+        if let Some(c) = unit.chars().next().filter(number_like) {
             return Err(format!(
                 "unexpected '{c}' in amount '{s}' (write decimals like 1.5 and fractions like 3/4 or 1 1/2)"
             ));
@@ -181,19 +183,64 @@ fn split_number(s: &str) -> (&str, &str) {
     s.split_at(s.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(s.len()))
 }
 
-/// The fraction of a mixed number: `" 1/2 cup"` → `("1", "2", " cup")`.
+/// The fraction of a mixed number: `" 1/2 cup"` or `" 1 / 2 cup"` →
+/// `("1", "2", " cup")`.
 fn leading_fraction(s: &str) -> Option<(&str, &str, &str)> {
     let unspaced = s.trim_start();
     if unspaced.len() == s.len() {
         return None;
     }
     let (top, rest) = split_number(unspaced);
-    let rest = rest.strip_prefix('/')?;
+    let rest = rest.trim_start().strip_prefix('/')?;
     if top.is_empty() {
         return None;
     }
-    let (den, rest) = split_number(rest);
+    let (den, rest) = split_number(rest.trim_start());
     Some((top, den, rest))
+}
+
+/// The Unicode fractions an amount may use, as (character, top, bottom).
+const VULGAR_FRACTIONS: &[(char, u8, u8)] = &[
+    ('½', 1, 2), ('⅓', 1, 3), ('⅔', 2, 3), ('¼', 1, 4), ('¾', 3, 4),
+    ('⅕', 1, 5), ('⅖', 2, 5), ('⅗', 3, 5), ('⅘', 4, 5), ('⅙', 1, 6),
+    ('⅚', 5, 6), ('⅛', 1, 8), ('⅜', 3, 8), ('⅝', 5, 8), ('⅞', 7, 8),
+];
+
+/// A leading Unicode fraction and what follows it: `"½ cup"` → `(0.5, " cup")`.
+fn leading_vulgar(s: &str) -> Option<(f64, &str)> {
+    let c = s.chars().next()?;
+    let &(_, top, bottom) = VULGAR_FRACTIONS.iter().find(|(v, _, _)| *v == c)?;
+    Some((top as f64 / bottom as f64, &s[c.len_utf8()..]))
+}
+
+/// Which search result `crono log --pick N` logs, counting from 1. There is
+/// no 0th result, so `--pick 0` is refused rather than read as the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pick(usize);
+
+impl Pick {
+    /// The result's position in the search results, counting from 0.
+    pub fn index(&self) -> usize {
+        self.0 - 1
+    }
+}
+
+impl fmt::Display for Pick {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for Pick {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.parse::<usize>() {
+            Ok(0) => Err("results count from 1; --pick 0 has nothing to pick".into()),
+            Ok(n) => Ok(Pick(n)),
+            Err(e) => Err(format!("{e}")),
+        }
+    }
 }
 
 /// A day specifier: `today`, `yesterday`, `tomorrow`, `-N` (N days ago),

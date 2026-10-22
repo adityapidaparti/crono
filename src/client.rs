@@ -14,7 +14,7 @@
 //!   disk and re-login happens only when the token is rejected.
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{NaiveDate, NaiveTime};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -29,7 +29,7 @@ const APP_BUILD: &str = "2807";
 pub struct AuthState {
     pub user_id: i64,
     pub token: String,
-    pub timezone: String,
+    pub timezone: Option<String>,
 }
 
 pub struct Client {
@@ -51,7 +51,7 @@ pub struct SearchFood {
     pub source: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Measure {
     pub id: i64,
     pub name: String,
@@ -124,7 +124,7 @@ impl Client {
         let auth = session::load_session()?.map(|s: Session| AuthState {
             user_id: s.user_id.unwrap_or_default(),
             token: s.token,
-            timezone: s.timezone.unwrap_or_else(|| "UTC".into()),
+            timezone: s.timezone,
         });
         Ok(Client { http, auth })
     }
@@ -179,22 +179,9 @@ impl Client {
         Ok(value)
     }
 
-    /// "Now" in the account's timezone (login response), falling back to local.
-    pub fn account_now(&self) -> (NaiveDate, NaiveTime) {
-        let tz: Option<chrono_tz::Tz> = self
-            .auth
-            .as_ref()
-            .and_then(|a| a.timezone.parse().ok());
-        match tz {
-            Some(tz) => {
-                let now = chrono::Utc::now().with_timezone(&tz);
-                (now.date_naive(), now.time())
-            }
-            None => {
-                let now = chrono::Local::now();
-                (now.date_naive(), now.time())
-            }
-        }
+    /// Today's date and the time of day in the account's timezone.
+    pub fn account_now(&self) -> Result<(NaiveDate, NaiveTime)> {
+        account_clock(self.auth()?.timezone.as_deref(), Utc::now())
     }
 
     // ---------- auth ----------
@@ -231,16 +218,12 @@ impl Client {
                 .and_then(Value::as_i64)
                 .context("login response missing user id")?,
             token: token.to_string(),
-            timezone: resp
-                .get("timezone")
-                .and_then(Value::as_str)
-                .unwrap_or("UTC")
-                .to_string(),
+            timezone: Some(resp.get("timezone").and_then(Value::as_str).unwrap_or("UTC").to_string()),
         };
         session::save_session(&Session {
             token: state.token.clone(),
             user_id: Some(state.user_id),
-            timezone: Some(state.timezone.clone()),
+            timezone: state.timezone.clone(),
             saved_at: Some(chrono::Utc::now().to_rfc3339()),
         })?;
         self.auth = Some(state.clone());
@@ -377,27 +360,8 @@ impl Client {
         day: NaiveDate,
         time: NaiveTime,
     ) -> Result<Value> {
-        let user_id = self.auth()?.user_id;
-        self.v2(
-            "add_serving",
-            json!({
-                "serving": {
-                    "order": meal.pack_order(),
-                    "day": cron_day(day),
-                    "time": cron_time(time),
-                    "offset": null,
-                    "source": null,
-                    "userId": user_id,
-                    "servingId": null,
-                    "type": "Serving",
-                    "foodId": food_id,
-                    "measureId": resolved.measure_id,
-                    "grams": resolved.grams,
-                    "translationId": 0
-                }
-            }),
-            2,
-        )
+        let body = serving_payload(self.auth()?.user_id, food_id, resolved, meal, day, time);
+        self.v2("add_serving", body, 2)
     }
 
     /// Raw diary entries for a day (all types, as returned — deletes need the
@@ -432,6 +396,48 @@ impl Client {
             bail!("delete failed: HTTP {status}: {}", resp.text().unwrap_or_default())
         }
     }
+}
+
+/// The `add_serving` request body that logs `resolved` of food `food_id` to
+/// `meal` on `day`.
+pub fn serving_payload(
+    user_id: i64,
+    food_id: i64,
+    resolved: &ResolvedAmount,
+    meal: Meal,
+    day: NaiveDate,
+    time: NaiveTime,
+) -> Value {
+    json!({
+        "serving": {
+            "order": meal.pack_order(),
+            "day": cron_day(day),
+            "time": cron_time(time),
+            "offset": null,
+            "source": null,
+            "userId": user_id,
+            "servingId": null,
+            "type": "Serving",
+            "foodId": food_id,
+            "measureId": resolved.measure_id,
+            "grams": resolved.grams,
+            "translationId": 0
+        }
+    })
+}
+
+/// The date and time of day at `now` in the account's timezone, which decide
+/// the day and meal food is filed under. A session without a timezone
+/// chrono-tz knows is refused: guessing UTC or the computer's clock could
+/// file food under the wrong day.
+pub fn account_clock(timezone: Option<&str>, now: DateTime<Utc>) -> Result<(NaiveDate, NaiveTime)> {
+    let name = timezone
+        .context("the saved session has no account timezone; log in again with `crono login <email>`")?;
+    let tz: chrono_tz::Tz = name.parse().map_err(|_| {
+        anyhow!("the saved session's timezone {name:?} isn't one crono knows; log in again with `crono login <email>`")
+    })?;
+    let now = now.with_timezone(&tz);
+    Ok((now.date_naive(), now.time()))
 }
 
 /// Keep original diary/food objects and unknown fields, with explicit identity.
@@ -522,11 +528,11 @@ fn units_in_name(m: &Measure, unit: &str) -> f64 {
 
 /// The measure a literal weight is logged against: the food's own `unit`
 /// measure, else its default, else any other — never a Recipe measure, whose
-/// `grams` Cronometer reads as a serving count.
+/// `grams` Cronometer reads as a serving count. Recipe measures are skipped
+/// before matching, so a recipe serving named "g" can't hide a "100 g" one.
 fn weight_measure<'a>(food: &'a Food, unit: &str, default: &'a Measure) -> Result<&'a Measure> {
     let by_weight = |m: &&Measure| m.kind != "Recipe";
-    find_measure(food, unit)
-        .filter(by_weight)
+    match_measure(food.measures.iter().filter(by_weight).collect(), unit)
         .or(Some(default).filter(by_weight))
         .or_else(|| food.measures.iter().find(by_weight))
         .ok_or_else(|| {
@@ -539,22 +545,16 @@ fn weight_measure<'a>(food: &'a Food, unit: &str, default: &'a Measure) -> Resul
 
 /// Case-insensitive measure lookup: exact name, then prefix, then substring.
 pub fn find_measure<'a>(food: &'a Food, unit: &str) -> Option<&'a Measure> {
+    match_measure(food.measures.iter().collect(), unit)
+}
+
+fn match_measure<'a>(measures: Vec<&'a Measure>, unit: &str) -> Option<&'a Measure> {
     let unit = unit.to_ascii_lowercase();
-    let names: Vec<String> = food
-        .measures
-        .iter()
-        .map(|m| m.name.to_ascii_lowercase())
-        .collect();
-    if let Some(i) = names.iter().position(|n| *n == unit) {
-        return food.measures.get(i);
-    }
-    if let Some(i) = names.iter().position(|n| n.starts_with(&unit)) {
-        return food.measures.get(i);
-    }
-    names
-        .iter()
-        .position(|n| n.contains(&unit))
-        .and_then(|i| food.measures.get(i))
+    let names: Vec<String> = measures.iter().map(|m| m.name.to_ascii_lowercase()).collect();
+    let first = |hit: &dyn Fn(&str) -> bool| names.iter().position(|n| hit(n)).map(|i| measures[i]);
+    first(&|n| n == unit)
+        .or_else(|| first(&|n| n.starts_with(&unit)))
+        .or_else(|| first(&|n| n.contains(&unit)))
 }
 
 /// Estimated kcal for a resolved amount (per-100g nutrients, or per reference
