@@ -39,8 +39,8 @@ crono export yesterday > day.json           # a day's raw diary and nutrient dat
 ```
 
 An amount can be `120g`, `5oz`, `3/4 cup`, `1 1/2 cup`, `1 ½ cup`, or a bare
-number of the food's default measure. Without `-m`, crono picks the meal from the time of
-day. `crono --help` covers the rest.
+number of the food's default measure. Without `-m`, crono picks the meal from
+the time of day. `crono --help` covers the rest.
 
 ## Good to know
 

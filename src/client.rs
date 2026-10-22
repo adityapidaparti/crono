@@ -218,7 +218,8 @@ impl Client {
                 .and_then(Value::as_i64)
                 .context("login response missing user id")?,
             token: token.to_string(),
-            timezone: Some(resp.get("timezone").and_then(Value::as_str).unwrap_or("UTC").to_string()),
+            // No guess: without a timezone, log, rm and day refuse to file food.
+            timezone: resp.get("timezone").and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string),
         };
         session::save_session(&Session {
             token: state.token.clone(),
@@ -432,7 +433,7 @@ pub fn serving_payload(
 /// file food under the wrong day.
 pub fn account_clock(timezone: Option<&str>, now: DateTime<Utc>) -> Result<(NaiveDate, NaiveTime)> {
     let name = timezone
-        .context("the saved session has no account timezone; log in again with `crono login <email>`")?;
+        .context("the saved session has no account timezone; log in again with `crono login <email>`, and if that doesn't help, set your timezone in Cronometer's settings")?;
     let tz: chrono_tz::Tz = name.parse().map_err(|_| {
         anyhow!("the saved session's timezone {name:?} isn't one crono knows; log in again with `crono login <email>`")
     })?;
